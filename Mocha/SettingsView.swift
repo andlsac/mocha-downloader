@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var theme: AppTheme
+    @StateObject private var updater = Updater()
     @AppStorage("showMenuBarIcon") private var showMenuBarIcon = true
     @AppStorage("menuBarIcon") private var menuBarIcon = "cup.and.saucer.fill"
     @AppStorage("menuBarOnly") private var menuBarOnly = false
@@ -110,21 +111,51 @@ struct SettingsView: View {
 
                 section("About") {
                     HStack {
-                        Text("Mocha · v0.1.0")
+                        Text("Mocha · v\(Updater.currentVersion)")
                             .font(.caption).foregroundStyle(theme.secondaryText)
                         Spacer()
-                        Button("Check for Updates") {
-                            NSWorkspace.shared.open(
-                                URL(string: "https://github.com/your-handle/mocha/releases/latest")!
-                            )
+                        Button {
+                            Task { await updater.check() }
+                        } label: {
+                            if updater.state == .checking {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Text("Check for Updates")
+                            }
                         }
                         .buttonStyle(.bordered).controlSize(.small)
+                        .disabled(updater.state == .checking)
                     }
+
+                    updateStatus
+
                     Text("MIT open-source · powered by yt-dlp")
                         .font(.caption2).foregroundStyle(theme.secondaryText.opacity(0.7))
                 }
             }
             .padding()
+        }
+    }
+
+    @ViewBuilder
+    private var updateStatus: some View {
+        switch updater.state {
+        case .upToDate:
+            Label("You're on the latest version", systemImage: "checkmark.circle.fill")
+                .font(.caption2).foregroundStyle(.green)
+        case .available(let version, let url):
+            HStack(spacing: 8) {
+                Label("Version \(version) available", systemImage: "arrow.down.circle.fill")
+                    .font(.caption2).foregroundStyle(theme.accent)
+                Spacer()
+                Button("Download") { NSWorkspace.shared.open(URL(string: url)!) }
+                    .controlSize(.small).buttonStyle(.borderedProminent).tint(theme.accent)
+            }
+        case .failed(let msg):
+            Label(msg, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption2).foregroundStyle(.orange).lineLimit(2)
+        case .idle, .checking:
+            EmptyView()
         }
     }
 
@@ -181,5 +212,64 @@ struct SettingsView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Updater
+
+/// Checks GitHub Releases for a newer version and surfaces the download link.
+@MainActor
+final class Updater: ObservableObject {
+    enum State: Equatable {
+        case idle, checking, upToDate
+        case available(version: String, url: String)
+        case failed(String)
+    }
+
+    @Published var state: State = .idle
+
+    static let currentVersion =
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+    private let repo = "andlsac/mocha-downloader"
+
+    func check() async {
+        state = .checking
+        let api = URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!
+        var req = URLRequest(url: api)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = json["tag_name"] as? String else {
+                state = .failed("Could not reach GitHub"); return
+            }
+            let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+
+            // Prefer the .dmg asset; fall back to the release page.
+            var link = json["html_url"] as? String ?? "https://github.com/\(repo)/releases/latest"
+            if let assets = json["assets"] as? [[String: Any]],
+               let dmg = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".dmg") == true }),
+               let url = dmg["browser_download_url"] as? String {
+                link = url
+            }
+
+            state = Self.isNewer(latest, than: Self.currentVersion)
+                ? .available(version: latest, url: link)
+                : .upToDate
+        } catch {
+            state = .failed(error.localizedDescription)
+        }
+    }
+
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let pa = a.split(separator: ".").map { Int($0) ?? 0 }
+        let pb = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x > y }
+        }
+        return false
     }
 }
